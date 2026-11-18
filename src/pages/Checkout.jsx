@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { addDoc, collection, doc, serverTimestamp, updateDoc, arrayUnion } from 'firebase/firestore'
 import { db } from '../firebase'
@@ -6,8 +6,28 @@ import { useAuth, useCart, useLang, useSettings } from '../context'
 import { deliveryCharge, geocode, money, reverseGeocode, roadDistanceKm } from '../lib/utils'
 import { lineText, lineTotal, weightLabel } from '../lib/qty'
 
+// Messages for the single "Use my live location" button flow
+const TXT = {
+  en: {
+    need: 'Enter your delivery address, or tap "Use my live location".',
+    hint: 'Or type your address. The distance is checked automatically.',
+    checked: 'Delivery charge updated. Please check the total and tap Place order again.',
+  },
+  hi: {
+    need: 'अपना डिलीवरी पता लिखें, या "मेरी लाइव लोकेशन इस्तेमाल करें" दबाएँ।',
+    hint: 'या अपना पता लिखें। दूरी अपने आप जाँची जाएगी।',
+    checked: 'डिलीवरी चार्ज अपडेट हो गया। कृपया कुल रकम देखें और फिर से ऑर्डर करें दबाएँ।',
+  },
+  mr: {
+    need: 'तुमचा डिलिव्हरीचा पत्ता लिहा, किंवा "माझे लाईव्ह लोकेशन वापरा" दाबा.',
+    hint: 'किंवा पत्ता लिहा. अंतर आपोआप तपासले जाईल.',
+    checked: 'डिलिव्हरी चार्ज अपडेट झाला. कृपया एकूण रक्कम पहा आणि पुन्हा ऑर्डर द्या दाबा.',
+  },
+}
+
 export default function Checkout() {
-  const { t, tr } = useLang()
+  const { t, tr, lang } = useLang()
+  const txt = TXT[lang] || TXT.en
   const { user, profile } = useAuth()
   const { lines, subtotal, clear } = useCart()
   const s = useSettings()
@@ -21,34 +41,49 @@ export default function Checkout() {
   const [msg, setMsg] = useState('')
   const [busy, setBusy] = useState(false)
   const [saveAddr, setSaveAddr] = useState(false)
+  const live = useRef(false)     // true when the point comes from live location or a saved address
+  const pending = useRef(null)   // the address check that is running right now
 
   useEffect(() => { if (profile) { setName((n) => n || profile.name || ''); setPhone((p) => p || profile.phone || '') } }, [profile])
 
-  const measure = async (point) => {
-    const d = await roadDistanceKm({ lat: s.shopLat, lng: s.shopLng }, point)
-    setPt(point); setKm(d)
-    if (d > s.maxKm) setMsg(t('tooFar', { n: s.maxKm })); else setMsg('')
-  }
+  const shop = { lat: s.shopLat, lng: s.shopLng }
 
-  const useLive = () => {
+  const apply = (point, d) => {
+    setPt(point); setKm(d)
+    setMsg(d > s.maxKm ? t('tooFar', { n: s.maxKm }) : '')
+  }
+  const measure = async (point) => apply(point, await roadDistanceKm(shop, point))
+
+  // The one button: use the phone's location
+  const goLive = () => {
+    live.current = true
     setMsg(t('locating'))
-    if (!navigator.geolocation) return setMsg(t('locFail'))
+    if (!navigator.geolocation) { live.current = false; return setMsg(t('locFail')) }
     navigator.geolocation.getCurrentPosition(async (pos) => {
       const point = { lat: pos.coords.latitude, lng: pos.coords.longitude }
       const text = await reverseGeocode(point.lat, point.lng)
       if (text) setAddr((a) => (a.trim() ? a : text))
       await measure(point)
-    }, () => setMsg(t('locFail')), { enableHighAccuracy: true, timeout: 15000 })
+    }, () => { live.current = false; setMsg(t('locFail')) }, { enableHighAccuracy: true, timeout: 15000 })
   }
 
-  const check = async () => {
-    if (!addr.trim()) return setMsg(t('needAddr'))
+  // Typed address: found on the map and measured automatically (when the customer leaves the box)
+  const check = () => {
+    if (live.current || pt || !addr.trim()) return Promise.resolve(null)
+    if (pending.current) return pending.current
     setMsg('...')
-    try {
-      const g = await geocode(addr, { lat: s.shopLat, lng: s.shopLng })
-      if (!g) { setPt(null); setKm(null); return setMsg(t('geoFail')) }
-      await measure({ lat: g.lat, lng: g.lng })
-    } catch (e) { setMsg(t('geoFail')) }
+    pending.current = (async () => {
+      try {
+        const g = await geocode(addr, shop)
+        if (live.current) return null
+        if (!g) { setPt(null); setKm(null); setMsg(t('geoFail')); return null }
+        const point = { lat: g.lat, lng: g.lng }
+        const d = await roadDistanceKm(shop, point)
+        apply(point, d)
+        return { point, dist: d }
+      } catch (e) { setMsg(t('geoFail')); return null }
+    })().finally(() => { pending.current = null })
+    return pending.current
   }
 
   const charge = km == null ? 0 : deliveryCharge(subtotal, km, s)
@@ -58,7 +93,17 @@ export default function Checkout() {
     if (!user) return setMsg(t('loginToOrder'))
     if (!s.isOpen) return setMsg(t('closedNote'))
     if (!name.trim() || !/^\d{10}$/.test(phone)) return setMsg('Enter your name and a 10 digit mobile number.')
-    if (km == null || !pt) return setMsg(t('needAddr'))
+
+    // Distance not known yet: measure it now, show the delivery charge, and let the customer confirm
+    if (!pt || km == null) {
+      if (!addr.trim()) return setMsg(txt.need)
+      setBusy(true)
+      const r = await check()
+      setBusy(false)
+      if (r) setMsg(r.dist > s.maxKm ? t('tooFar', { n: s.maxKm }) : txt.checked)
+      return
+    }
+
     if (km > s.maxKm) return setMsg(t('tooFar', { n: s.maxKm }))
     if (subtotal < s.minOrder) return setMsg(t('minOrderMsg', { n: s.minOrder }))
     const bad = lines.find((l) => l.qty > Number(l.stock ?? 0))
@@ -104,7 +149,7 @@ export default function Checkout() {
         {profile?.addresses?.length > 0 && (
           <div className="flex flex-wrap gap-2">
             {profile.addresses.map((a, i) => (
-              <button key={i} onClick={() => { setAddr(a.text); measure({ lat: a.lat, lng: a.lng }) }}
+              <button key={i} onClick={() => { live.current = true; setAddr(a.text); measure({ lat: a.lat, lng: a.lng }) }}
                 className="btn-line btn-sm max-w-full truncate">{a.text.slice(0, 40)}</button>
             ))}
           </div>
@@ -113,11 +158,17 @@ export default function Checkout() {
         <div>
           <label className="label">{t('addrLabel')}</label>
           <textarea rows={3} className="input" placeholder={t('addrHint')} value={addr}
-            onChange={(e) => { setAddr(e.target.value); setKm(null); setPt(null) }} />
+            onBlur={check}
+            onChange={(e) => {
+              const v = e.target.value
+              setAddr(v)
+              if (!v.trim()) live.current = false
+              if (!live.current) { setKm(null); setPt(null) }
+            }} />
         </div>
-        <div className="flex flex-wrap gap-2">
-          <button type="button" onClick={useLive} className="btn-line btn-sm">📍 {t('useLocation')}</button>
-          <button type="button" onClick={check} className="btn-amber btn-sm">{t('findAddr')}</button>
+        <div className="space-y-1.5">
+          <button type="button" onClick={goLive} className="btn-amber w-full sm:w-auto">📍 {t('useLocation')}</button>
+          <p className="text-xs text-ink/60">{txt.hint}</p>
         </div>
         {km != null && <p className="rounded-lg bg-leaf/15 p-2.5 text-sm text-forest">{t('distance')}: <b>{km} {t('km')}</b></p>}
         <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={saveAddr} onChange={(e) => setSaveAddr(e.target.checked)} /> {t('saveAddr')}</label>
